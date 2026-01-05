@@ -21,10 +21,9 @@ def clean_output(text):
     ansi_escape = re.compile(r'\x1B(?:[@-Z\-_]| [0-?]*[@-~])')
     return ansi_escape.sub('', text).strip()
 
-def call_cli(cli_name, prompt, context_files=None):
+def call_cli(cli_name, prompt, context_files=None, retries=3, delay=20):
     """
-    Executes the specified CLI. 
-    Simulates /clear by running a fresh process for each call.
+    Executes the specified CLI with exponential backoff for rate limits.
     """
     logger.info(f"[{cli_name.upper()}] Thinking...")
     
@@ -38,35 +37,50 @@ def call_cli(cli_name, prompt, context_files=None):
     
     command = []
     if cli_name == "claude":
-        command = ["claude", full_prompt] 
-             
+        command = ["claude", full_prompt]
     elif cli_name == "gemini":
         if os.path.exists("gemini.ps1"):
             command = ["powershell", "-NoProfile", "-File", "gemini.ps1", full_prompt]
         else:
             command = ["gemini", full_prompt]
-            
-elif cli_name == "codex":
-        # Placeholder: Using Gemini to simulate Codex if codex CLI isn't installed
+    elif cli_name == "codex":
         command = ["gemini", f"SIMULATE CODEX: {full_prompt}"]
 
-    try:
-        result = subprocess.run(
-            command, 
-            capture_output=True, 
-            text=True, 
-            encoding='utf-8', 
-            timeout=240, 
-            shell=True if os.name == 'nt' else False
-        )
-        
-        if result.returncode != 0:
-            return f"Error generating plan with {cli_name}: {result.stderr}"
+    for attempt in range(retries):
+        try:
+            result = subprocess.run(
+                command, 
+                capture_output=True, 
+                text=True, 
+                encoding='utf-8', 
+                timeout=240, 
+                shell=True if os.name == 'nt' else False
+            )
             
-        return clean_output(result.stdout)
+            output = clean_output(result.stdout)
+            errors = result.stderr.lower()
+            
+            # Rate Limit Detection
+            is_limited = any(x in errors or x in output.lower() for x in 
+                            ["rate limit", "429", "too many requests", "overloaded", "try again in"])
+            
+            if is_limited:
+                wait_time = delay * (2 ** attempt)
+                logger.warning(f"[{cli_name.upper()}] Rate limited. Retrying in {wait_time}s... (Attempt {attempt+1}/{retries})")
+                time.sleep(wait_time)
+                continue
 
-    except Exception as e:
-        return f"Exception: {str(e)}"
+            if result.returncode != 0 and not is_limited:
+                return f"Error generating plan with {cli_name}: {result.stderr}"
+                
+            return output
+
+        except Exception as e:
+            if attempt == retries - 1:
+                return f"Exception: {str(e)}"
+            time.sleep(delay)
+            
+    return f"Error: {cli_name.upper()} is consistently rate limited. Skipping."
 
 def save_md(path, content):
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -110,11 +124,19 @@ def run_brainstorm(project_name, objective):
     drafts = []
     for i in range(1, 4):
         logger.info(f"Drafting Round {i}...")
+        round_failures = 0
         for cli in clis:
             plan = call_cli(cli, f"Draft #{i} for '{project_name}'. Objective: {objective}. Provide a full technical roadmap.")
+            if "consistently rate limited" in plan:
+                round_failures += 1
+                
             path = os.path.join(session_dir, f"round{i}-draft-{cli}.md")
             save_md(path, plan)
             drafts.append({"id": f"{cli}-R{i}", "content": plan, "path": path})
+        
+        if round_failures == len(clis):
+            logger.warning("!!! ALL MODELS RATE LIMITED !!! Entering 2-minute cool down...")
+            time.sleep(120)
 
     # 2. RANKING ROUND 1 (Find Top 3)
     logger.info("PHASE 2: Ranking Initial Drafts...")
