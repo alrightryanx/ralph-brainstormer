@@ -88,19 +88,20 @@ def save_md(path, content):
         f.write(content)
     logger.info(f"Saved: {path}")
 
-def get_rankings(clis, plans, objective):
-    """Asks multiple CLIs to rank a list of plans."""
+def get_rankings(clis, plans, objective, round_num=1):
+    """Asks multiple CLIs to rank a list of plans using a 'New Agent' persona."""
     all_plans_text = ""
     for d in plans:
         all_plans_text += f"\n\n=== PLAN ID: {d['id']} ===\n{d['content'][:800]}...\n"
     
-    ranking_prompt = f"Objective: {objective}\n\nReview these plans. Rank them based on technical feasibility, scalability, and depth. Return ONLY JSON: {{ 'rank': ['id1', 'id2', ...] }}\n\n{all_plans_text}"
+    persona = "You are a NEW evaluator agent hired to audit the following plans." if round_num > 1 else "You are a lead architect."
+    ranking_prompt = f"{persona}\nObjective: {objective}\n\nReview these plans. Rank them based on technical feasibility, scalability, and depth. Return ONLY JSON: {{ 'rank': ['id1', 'id2', ...] }}\n\n{all_plans_text}"
     
     votes = {}
     for cli in clis:
         resp = call_cli(cli, ranking_prompt)
         try:
-            json_match = re.search(r'{{.*}}', resp, re.DOTALL)
+            json_match = re.search(r'\{.*\}', resp, re.DOTALL)
             if json_match:
                 data = json.loads(json_match.group(0))
                 rank_list = data.get('rank', [])
@@ -108,7 +109,7 @@ def get_rankings(clis, plans, objective):
                     # Borda count: 1st place gets max points (len(plans))
                     votes[pid] = votes.get(pid, 0) + (len(plans) - idx)
         except:
-            logger.warning(f"[{cli}] Ranking parse failed or no JSON returned.")
+            logger.warning(f"[{cli.upper()}] Ranking parse failed or no JSON returned.")
     
     return sorted(votes.items(), key=lambda x: x[1], reverse=True)
 
@@ -119,6 +120,10 @@ def run_brainstorm(project_name, objective):
     
     clis = ["claude", "gemini", "codex"]
     
+    print("\n" + "="*60)
+    print(f"  🚀 RALPH MODE: {project_name.upper()}")
+    print("="*60 + "\n")
+
     # 1. GENERATE 9 DRAFTS
     logger.info("PHASE 1: Generating 9 Initial Plans (3 Rounds x 3 CLIs)...")
     drafts = []
@@ -140,7 +145,7 @@ def run_brainstorm(project_name, objective):
 
     # 2. RANKING ROUND 1 (Find Top 3)
     logger.info("PHASE 2: Ranking Initial Drafts...")
-    sorted_ids = get_rankings(clis, drafts, objective)
+    sorted_ids = get_rankings(clis, drafts, objective, round_num=1)
     top_3_ids = [x[0] for x in sorted_ids[:3]]
     top_3_plans = [d for d in drafts if d['id'] in top_3_ids]
     logger.info(f"Top 3 Selected: {top_3_ids}")
@@ -190,32 +195,38 @@ def run_brainstorm(project_name, objective):
     # 5. FINAL RANKING (3 Enhanced + 6 Debate = 9 Plans)
     logger.info("PHASE 5: Final Ranking of the 9 Best Plans...")
     final_pool = enhanced + debate_pool
-    final_rankings = get_rankings(clis, final_pool, objective)
+    final_rankings = get_rankings(clis, final_pool, objective, round_num=2)
     winner_id = final_rankings[0][0]
     winner = next(p for p in final_pool if p['id'] == winner_id)
 
     # 6. FINAL SELECTION & DECISION
-    logger.info(f"PHASE 6: Final Decision. Winner: {winner_id}")
+    logger.info(f"PHASE 6: Final Consensus Decision. Winner: {winner_id}")
     master_path = os.path.join(RALPH_DIR, project_name, "FINAL_MASTER_PLAN.md")
     
     # Final analysis by all 3 CLIs on the winner
-    approvals = []
+    verdicts = []
+    approved_count = 0
     for cli in clis:
-        check = call_cli(cli, f"This is the winning plan. Is it ready for implementation? Provide a brief final verdict and say 'APPROVED' if it is solid.\n\n{winner['content']}")
-        approvals.append(f"### {cli.upper()} Verdict:\n{check}")
+        decision = call_cli(cli, f"FINAL AUDIT: Review the winning plan. Decide if it is implementation-ready. End your response with 'VERDICT: GO' or 'VERDICT: NO-GO'.\n\n{winner['content']}")
+        verdicts.append(f"### {cli.upper()} AUDIT:\n{decision}")
+        if "VERDICT: GO" in decision.upper():
+            approved_count += 1
+    
+    final_status = "APPROVED" if approved_count >= 2 else "REJECTED"
     
     final_content = f"""# FINAL MASTER PLAN: {project_name}
 ## Winner ID: {winner_id}
 ## Strategy: Multi-Agent Debate & Consensus
+## Consensus Status: {final_status} ({approved_count}/3 Go Votes)
 
 {winner['content']}
 
 ---
 ## Final Consensus Decisions:
-{"\n\n".join(approvals)}
+{"\n\n".join(verdicts)}
 """
     save_md(master_path, final_content)
-    print(f"\n[SUCCESS] Ralph Brainstormer complete.")
+    print(f"\n[SUCCESS] Ralph Brainstormer complete. Status: {final_status}")
     print(f"Master Plan saved to: {master_path}")
 
 if __name__ == "__main__":
