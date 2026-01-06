@@ -156,19 +156,26 @@ def run_brainstorm(project_name, objective):
         enhanced.append({"id": f"Eh-{plan['id']}", "content": new_content, "path": path})
 
     # 4. AGENT DEBATE (Generate 6 NEW PLANS)
-    logger.info("PHASE 4: Starting Agent A/B Debates...")
+    logger.info("PHASE 4: Starting Multi-Turn Agent A/B Debates...")
     debate_pool = []
     for plan in enhanced:
         logger.info(f"Debating Plan: {plan['id']}")
-        # Agent A (Claude) Critics
-        questions = call_cli("claude", "Analyze this plan. Ask 3 extremely critical technical questions about its weaknesses.", context_files=[plan['path']])
         
-        # Agent B (Gemini) Answers
-        answers = call_cli("gemini", f"As a lead engineer, answer these 3 critical questions for the plan:\n{questions}", context_files=[plan['path']])
+        # Turn 1: Agent A asks questions
+        questions = call_cli("claude", "Analyze this plan. Ask 3 critical technical questions to the lead engineer (Agent B).", context_files=[plan['path']])
         
-        # Both Revise based on the exchange
-        rev_a = call_cli("claude", f"Based on these answers, rewrite the original plan to be bulletproof:\nAnswers:\n{answers}", context_files=[plan['path']])
-        rev_b = call_cli("gemini", f"Create your own improved version of the plan incorporating your answers:\nAnswers:\n{answers}", context_files=[plan['path']])
+        # Turn 2: Agent B answers
+        answers = call_cli("gemini", f"You are Agent B. Answer these questions from Agent A regarding the plan:\n{questions}", context_files=[plan['path']])
+        
+        # Turn 3: Agent A responds to the answers
+        response_a = call_cli("claude", f"Agent B provided these answers. Respond to them with any remaining concerns or critiques:\n{answers}", context_files=[plan['path']])
+        
+        # Turn 4: Agent B reflects (No response) and improves the plan
+        # This creates the first of the 2 new plans for this parent
+        rev_b = call_cli("gemini", f"Analyze Agent A's critique of your answers. Without responding back, incorporate all feedback and produce your own improved version of the Master Plan.\nCritique:\n{response_a}", context_files=[plan['path']])
+        
+        # Turn 5: Agent A sees the revised plan and makes their own version
+        rev_a = call_cli("claude", f"Agent B has revised the plan based on your critique. Now, create YOUR own definitive version of this Master Plan.\nAgent B's Revised Version:\n{rev_b}", context_files=[plan['path']])
         
         path_a = os.path.join(session_dir, f"debate-A-{plan['id']}.md")
         path_b = os.path.join(session_dir, f"debate-B-{plan['id']}.md")
@@ -176,8 +183,8 @@ def run_brainstorm(project_name, objective):
         save_md(path_b, rev_b)
         
         debate_pool.extend([
-            {"id": f"Deb-A-{plan['id']}", "content": rev_a, "path": path_a},
-            {"id": f"Deb-B-{plan['id']}", "content": rev_b, "path": path_b}
+            {"id": f"RevA-{plan['id']}", "content": rev_a, "path": path_a},
+            {"id": f"RevB-{plan['id']}", "content": rev_b, "path": path_b}
         ])
 
     # 5. FINAL RANKING (3 Enhanced + 6 Debate = 9 Plans)
