@@ -36,15 +36,24 @@ def call_cli(cli_name, prompt, context_files=None, retries=3, delay=20):
                     full_prompt += f"\nFile: {os.path.basename(cf)}\n{f.read()}\n"
     
     command = []
+    # Windows-specific handling for PowerShell/CMD execution
+    is_windows = os.name == 'nt'
+    shell_flag = is_windows
+
     if cli_name == "claude":
         command = ["claude", full_prompt]
     elif cli_name == "gemini":
-        if os.path.exists("gemini.ps1"):
+        if is_windows and os.path.exists("gemini.ps1"):
             command = ["powershell", "-NoProfile", "-File", "gemini.ps1", full_prompt]
         else:
             command = ["gemini", full_prompt]
     elif cli_name == "codex":
-        command = ["gemini", f"SIMULATE CODEX: {full_prompt}"]
+        # Force PowerShell execution for codex on Windows to ensure .ps1/npm scripts run correctly
+        if is_windows:
+             # Use -Command to allow shell execution of 'codex' which might be an alias or script in PATH
+             command = ["powershell", "-NoProfile", "-Command", "codex", full_prompt]
+        else:
+             command = ["codex", full_prompt]
 
     for attempt in range(retries):
         try:
@@ -53,16 +62,18 @@ def call_cli(cli_name, prompt, context_files=None, retries=3, delay=20):
                 capture_output=True, 
                 text=True, 
                 encoding='utf-8', 
-                timeout=240, 
-                shell=True if os.name == 'nt' else False
+                timeout=300, 
+                shell=False # Shell=True can be dangerous/messy with list args on Windows. We use direct executable calls.
             )
             
             output = clean_output(result.stdout)
-            errors = result.stderr.lower()
+            errors = result.stderr.lower() if result.stderr else ""
             
-            # Rate Limit Detection
-            is_limited = any(x in errors or x in output.lower() for x in 
-                            ["rate limit", "429", "too many requests", "overloaded", "try again in"])
+            # Rate Limit & Error Detection
+            # Some CLIs print errors to stdout, so we check both.
+            combined_log = (output + errors).lower()
+            is_limited = any(x in combined_log for x in 
+                            ["rate limit", "429", "too many requests", "overloaded", "try again in", "capacity"])
             
             if is_limited:
                 wait_time = delay * (2 ** attempt)
@@ -71,8 +82,20 @@ def call_cli(cli_name, prompt, context_files=None, retries=3, delay=20):
                 continue
 
             if result.returncode != 0 and not is_limited:
+                # If command not found, try to be helpful
+                if "is not recognized" in errors or "command not found" in errors:
+                    logger.error(f"Command '{cli_name}' not found. Please ensure it is installed.")
+                    return f"Error: {cli_name} command not found."
+                # Allow partial output even on error codes, sometimes CLIs are weird
+                if output and len(output) > 50:
+                    logger.warning(f"[{cli_name.upper()}] returned non-zero exit code but had output. Using it.")
+                    return output
                 return f"Error generating plan with {cli_name}: {result.stderr}"
-                
+            
+            if not output.strip():
+                 # Empty output is a failure
+                 return f"Error: {cli_name} returned empty output."
+
             return output
 
         except Exception as e:
@@ -89,145 +112,197 @@ def save_md(path, content):
     logger.info(f"Saved: {path}")
 
 def get_rankings(clis, plans, objective, round_num=1):
-    """Asks multiple CLIs to rank a list of plans using a 'New Agent' persona."""
+    """Asks multiple CLIs to rank a list of plans using a rigorous persona."""
     all_plans_text = ""
     for d in plans:
-        all_plans_text += f"\n\n=== PLAN ID: {d['id']} ===\n{d['content'][:800]}...\n"
+        all_plans_text += f"\n\n=== PLAN ID: {d['id']} ===\n{d['content'][:2500]}...\n"
     
-    persona = "You are a NEW evaluator agent hired to audit the following plans." if round_num > 1 else "You are a lead architect."
-    ranking_prompt = f"{persona}\nObjective: {objective}\n\nReview these plans. Rank them based on technical feasibility, scalability, and depth. Return ONLY JSON: {{ 'rank': ['id1', 'id2', ...] }}\n\n{all_plans_text}"
+    persona = (
+        "You are a PRINCIPAL ARCHITECT and RUTHLESS EVALUATOR."
+        "You DO NOT tolerate generic, shallow, or hallucinated solutions. "
+        "You value technical depth, feasibility, and specific implementation details over buzzwords."
+    )
+    
+    ranking_prompt = (
+        f"{persona}\nObjective: {objective}\n\n"
+        f"Review these plans carefully. Rank them from BEST to WORST.\n"
+        f"Scoring Criteria (0-100):\n"
+        f" - Technical Feasibility (40%)\n"
+        f" - Completeness (30%)\n"
+        f" - Innovation (30%)\n\n"
+        f"CRITICAL: Be extremely strict. A standard generic plan should score < 50.\n"
+        f"Return ONLY a JSON object in this format:\n"
+        f"{{ \"rank\": [\"id_of_1st_place\", \"id_of_2nd_place\", ...], \"scores\": {{ \"id\": 85, ... }}, \"critique\": \"Brief explanation of choices\" }}\n\n"
+        f"{all_plans_text}"
+    )
     
     votes = {}
-    for cli in clis:
+    
+    # We rotate the judge to avoid bias, or use all of them
+    judges = clis
+    
+    for cli in judges:
+        logger.info(f"Asking {cli.upper()} to judge...")
         resp = call_cli(cli, ranking_prompt)
         try:
+            # Extract JSON from potential markdown blocks
             json_match = re.search(r'\{.*\}', resp, re.DOTALL)
             if json_match:
                 data = json.loads(json_match.group(0))
                 rank_list = data.get('rank', [])
+                
+                logger.info(f"[{cli.upper()}] Ranking: {rank_list}")
+                
                 for idx, pid in enumerate(rank_list):
                     # Borda count: 1st place gets max points (len(plans))
+                    # Weighted by rank (higher is better)
                     votes[pid] = votes.get(pid, 0) + (len(plans) - idx)
-        except:
-            logger.warning(f"[{cli.upper()}] Ranking parse failed or no JSON returned.")
+            else:
+                logger.warning(f"[{cli.upper()}] No valid JSON found in response.")
+        except Exception as e:
+            logger.warning(f"[{cli.upper()}] Ranking parse failed: {e}")
     
     return sorted(votes.items(), key=lambda x: x[1], reverse=True)
+
+def synthesize_ideas(clis, top_plans, objective):
+    """Combines the best elements of the top plans into one unified blueprint."""
+    logger.info("Synthesizing Top 3 Plans into a Unified Blueprint...")
+    
+    combined_text = ""
+    for i, plan in enumerate(top_plans):
+        combined_text += f"\n\n--- SOURCE PLAN {i+1} (ID: {plan['id']}) ---\n{plan['content']}\n"
+        
+    synthesizer = "claude" # Claude is often good at long context synthesis
+    
+    prompt = (
+        f"You are a PRINCIPAL ENGINEER tasked with creating a UNIFIED MASTER PLAN.\n"
+        f"Objective: {objective}\n\n"
+        f"I have provided {len(top_plans)} promising drafts below. "
+        f"Your job is to MERGE them into a single, cohesive, superior architecture.\n"
+        f"MANDATE:\n"
+        f"- CROSS-POLLINATE: Explicitly combine Idea A from Agent X with Idea B from Agent Y if they are synergistic.\n"
+        f"- RESOLVE CONFLICTS: Choose the technically superior option when plans disagree.\n"
+        f"- NO FLUFF: Go straight to architecture, code structure, and implementation steps.\n\n"
+        f"{combined_text}"
+    )
+    
+    unified_plan = call_cli(synthesizer, prompt)
+    return unified_plan
 
 def run_brainstorm(project_name, objective):
     session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     session_dir = os.path.join(RALPH_DIR, project_name, session_id)
     os.makedirs(session_dir, exist_ok=True)
     
+    # Ensure CLIs are actual agents, not simulations
     clis = ["claude", "gemini", "codex"]
     
     print("\n" + "="*60)
-    print(f"  🚀 RALPH MODE: {project_name.upper()}")
+    print(f"  🚀 RALPH BRAINSTORMER v2: {project_name.upper()}")
     print("="*60 + "\n")
 
-    # 1. GENERATE 9 DRAFTS
-    logger.info("PHASE 1: Generating 9 Initial Plans (3 Rounds x 3 CLIs)...")
+    # 1. DRAFTING PHASE (Collaborative Awareness)
+    logger.info("PHASE 1: Generating Initial Drafts (Collaborative Mode)...")
     drafts = []
-    for i in range(1, 4):
-        logger.info(f"Drafting Round {i}...")
-        round_failures = 0
+    
+    # We will do 2 rounds. Round 2 sees a summary of Round 1.
+    previous_round_summary = ""
+    
+    for r in range(1, 3): # 2 Rounds
+        logger.info(f"Drafting Round {r}...")
         for cli in clis:
-            plan = call_cli(cli, f"Draft #{i} for '{project_name}'. Objective: {objective}. Provide a full technical roadmap.")
-            if "consistently rate limited" in plan:
-                round_failures += 1
-                
-            path = os.path.join(session_dir, f"round{i}-draft-{cli}.md")
-            save_md(path, plan)
-            drafts.append({"id": f"{cli}-R{i}", "content": plan, "path": path})
-        
-        if round_failures == len(clis):
-            logger.warning("!!! ALL MODELS RATE LIMITED !!! Entering 2-minute cool down...")
-            time.sleep(120)
+            context = ""
+            if previous_round_summary:
+                context = (
+                    f"\n\n--- INTELLIGENCE FROM ROUND 1 ---\n"
+                    f"The following ideas were proposed by your peers:\n{previous_round_summary}\n\n"
+                    f"INSTRUCTION: Analyze these ideas. IMPROVE upon them. Do not just repeat them. "
+                    f"If you see a flaw in another agent's plan, fix it in yours."
+                )
+            
+            prompt = f"Draft #{r} for '{project_name}'. Objective: {objective}. Provide a unique, high-level technical approach.{context}"
+            
+            plan = call_cli(cli, prompt)
+            
+            if "Error" in plan and len(plan) < 100:
+                logger.warning(f"Skipping empty/error plan from {cli}")
+                continue
 
-    # 2. RANKING ROUND 1 (Find Top 3)
-    logger.info("PHASE 2: Ranking Initial Drafts...")
+            path = os.path.join(session_dir, f"round{r}-draft-{cli}.md")
+            save_md(path, plan)
+            drafts.append({"id": f"{cli}-R{r}", "content": plan, "path": path})
+        
+        # Summarize Round 1 for Round 2
+        if r == 1 and drafts:
+             logger.info("Summarizing Round 1 for context...")
+             # We want the summary to attribute ideas
+             summary_prompt = (
+                 "Summarize the key technical approaches in these drafts. "
+                 "Format: 'Agent [ID] proposed [Idea]'. "
+                 "Identify unique contributions from each."
+             )
+             summary_context = [d['path'] for d in drafts]
+             previous_round_summary = call_cli("gemini", summary_prompt, context_files=summary_context)
+
+    if not drafts:
+        logger.error("No drafts generated. Exiting.")
+        return
+
+    # 2. RANKING & SELECTION
+    logger.info("PHASE 2: Strict Ranking of Drafts...")
     sorted_ids = get_rankings(clis, drafts, objective, round_num=1)
-    top_3_ids = [x[0] for x in sorted_ids[:3]]
+    
+    if not sorted_ids:
+        logger.error("Ranking failed. Using first 3 drafts.")
+        top_3_ids = [d['id'] for d in drafts[:3]]
+    else:
+        top_3_ids = [x[0] for x in sorted_ids[:3]]
+        
     top_3_plans = [d for d in drafts if d['id'] in top_3_ids]
     logger.info(f"Top 3 Selected: {top_3_ids}")
 
-    # 3. ENHANCEMENT
-    logger.info("PHASE 3: Enhancing Top 3 Winners...")
-    enhanced = []
-    for i, plan in enumerate(top_3_plans):
-        cli = clis[i % len(clis)]
-        new_content = call_cli(cli, f"You are refining a Top Pick Plan. Expand it into a comprehensive Master Plan with architecture, dependencies, and risks.\n\nOriginal Content:\n{plan['content']}")
-        path = os.path.join(session_dir, f"enhanced-{plan['id']}.md")
-        save_md(path, new_content)
-        enhanced.append({"id": f"Eh-{plan['id']}", "content": new_content, "path": path})
+    # 3. SYNTHESIS (Combining Ideas)
+    logger.info("PHASE 3: Synthesizing Unified Blueprint...")
+    unified_content = synthesize_ideas(clis, top_3_plans, objective)
+    unified_path = os.path.join(session_dir, "unified-alpha-plan.md")
+    save_md(unified_path, unified_content)
 
-    # 4. AGENT DEBATE (Generate 6 NEW PLANS)
-    logger.info("PHASE 4: Starting Multi-Turn Agent A/B Debates...")
-    debate_pool = []
-    for plan in enhanced:
-        logger.info(f"Debating Plan: {plan['id']}")
+    # 4. CRITIQUE & REFINE (The "Boardroom" Meeting)
+    logger.info("PHASE 4: Boardroom Critique & Refinement...")
+    
+    # Step A: Collect Critiques
+    critiques = ""
+    for cli in clis:
+        logger.info(f"Requesting critique from {cli.upper()}...")
+        crit = call_cli(cli, f"Critique this Unified Plan. Identify 3 fatal flaws, missing components, or optimization opportunities. Be harsh.", context_files=[unified_path])
+        critiques += f"\n\n### Critique from {cli.upper()}:\n{crit}\n"
         
-        # Turn 1: Agent A asks questions
-        questions = call_cli("claude", "Analyze this plan. Ask 3 critical technical questions to the lead engineer (Agent B).", context_files=[plan['path']])
-        
-        # Turn 2: Agent B answers
-        answers = call_cli("gemini", f"You are Agent B. Answer these questions from Agent A regarding the plan:\n{questions}", context_files=[plan['path']])
-        
-        # Turn 3: Agent A responds to the answers
-        response_a = call_cli("claude", f"Agent B provided these answers. Respond to them with any remaining concerns or critiques:\n{answers}", context_files=[plan['path']])
-        
-        # Turn 4: Agent B reflects (No response) and improves the plan
-        # This creates the first of the 2 new plans for this parent
-        rev_b = call_cli("gemini", f"Analyze Agent A's critique of your answers. Without responding back, incorporate all feedback and produce your own improved version of the Master Plan.\nCritique:\n{response_a}", context_files=[plan['path']])
-        
-        # Turn 5: Agent A sees the revised plan and makes their own version
-        rev_a = call_cli("claude", f"Agent B has revised the plan based on your critique. Now, create YOUR own definitive version of this Master Plan.\nAgent B's Revised Version:\n{rev_b}", context_files=[plan['path']])
-        
-        path_a = os.path.join(session_dir, f"debate-A-{plan['id']}.md")
-        path_b = os.path.join(session_dir, f"debate-B-{plan['id']}.md")
-        save_md(path_a, rev_a)
-        save_md(path_b, rev_b)
-        
-        debate_pool.extend([
-            {"id": f"RevA-{plan['id']}", "content": rev_a, "path": path_a},
-            {"id": f"RevB-{plan['id']}", "content": rev_b, "path": path_b}
-        ])
-
-    # 5. FINAL RANKING (3 Enhanced + 6 Debate = 9 Plans)
-    logger.info("PHASE 5: Final Ranking of the 9 Best Plans...")
-    final_pool = enhanced + debate_pool
-    final_rankings = get_rankings(clis, final_pool, objective, round_num=2)
-    winner_id = final_rankings[0][0]
-    winner = next(p for p in final_pool if p['id'] == winner_id)
-
-    # 6. FINAL SELECTION & DECISION
-    logger.info(f"PHASE 6: Final Consensus Decision. Winner: {winner_id}")
+    critique_path = os.path.join(session_dir, "boardroom-critiques.md")
+    save_md(critique_path, critiques)
+    
+    # Step B: Final Polish (Codex or Gemini applies the fixes)
+    logger.info("PHASE 5: Finalizing Master Plan...")
+    final_architect = "claude" # Claude is good at final docs
+    final_prompt = (
+        f"You are the Lead Architect. I have a Unified Plan and a set of Critiques from the senior team.\n"
+        f"Your goal: Rewrite the plan into the FINAL VERSION.\n"
+        f"- Address the critiques.\n"
+        f"- Ensure formatting is perfect (Markdown).\n"
+        f"- Add a 'Next Steps' section.\n\n"
+        f"Original Plan:\n{unified_content}\n\n"
+        f"Critiques:\n{critiques}"
+    )
+    
+    final_plan = call_cli(final_architect, final_prompt)
     master_path = os.path.join(RALPH_DIR, project_name, "FINAL_MASTER_PLAN.md")
     
-    # Final analysis by all 3 CLIs on the winner
-    verdicts = []
-    approved_count = 0
-    for cli in clis:
-        decision = call_cli(cli, f"FINAL AUDIT: Review the winning plan. Decide if it is implementation-ready. End your response with 'VERDICT: GO' or 'VERDICT: NO-GO'.\n\n{winner['content']}")
-        verdicts.append(f"### {cli.upper()} AUDIT:\n{decision}")
-        if "VERDICT: GO" in decision.upper():
-            approved_count += 1
+    # 5. FINAL DECISION
+    save_md(master_path, final_plan)
     
-    final_status = "APPROVED" if approved_count >= 2 else "REJECTED"
-    
-    final_content = f"""# FINAL MASTER PLAN: {project_name}
-## Winner ID: {winner_id}
-## Strategy: Multi-Agent Debate & Consensus
-## Consensus Status: {final_status} ({approved_count}/3 Go Votes)
-
-{winner['content']}
-
----
-## Final Consensus Decisions:
-{"\n\n".join(verdicts)}
-"""
-    save_md(master_path, final_content)
-    print(f"\n[SUCCESS] Ralph Brainstormer complete. Status: {final_status}")
-    print(f"Master Plan saved to: {master_path}")
+    print("\n" + "="*60)
+    print(f"  DONE! Master Plan Ready.")
+    print(f"  Location: {master_path}")
+    print("="*60 + "\n")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Ralph Mode Brainstorming Engine")

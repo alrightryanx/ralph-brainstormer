@@ -2,17 +2,18 @@
 
 Ralph Brainstormer is a multi-agent planning engine that uses a "Debate & Consensus" workflow to generate high-quality technical roadmaps. It pits multiple AI models (Claude, Gemini, Codex) against each other to critique, refine, and ultimately agree on a winning plan.
 
-## 🚀 The "Ralph Mode" Workflow
+## 🚀 The "Ralph Mode" Workflow v2.0
 
-1.  **Drafting Phase**: Generates 9 unique plans (3 iterations x 3 AI models).
-2.  **Ranking (Round 1)**: All models vote on the drafts to find the Top 3.
-3.  **Expansion**: The Top 3 winners are expanded into detailed Master Plans.
-4.  **Agent Debate**: 
-    *   **Agent A (Critics)**: Identify 3 critical technical weaknesses per plan.
-    *   **Agent B (Solvers)**: Provide detailed technical solutions to those weaknesses.
-    *   **Revision**: Both agents create revised "perfect" versions of the plans.
-5.  **Final Ranking**: All 9 refined plans (3 Enhanced + 6 Debate) are ranked again.
-6.  **Consensus**: All models review the winning plan and provide a final "Verdict" and "Approval".
+1.  **Drafting Phase (Collaborative)**: Generates 6 unique plans (2 iterations x 3 AI models).
+    *   *New:* Agents are aware of each other's drafts in Round 2. "Claude proposed X, so I will propose Y to complement it."
+2.  **Ranking (The Ruthless Judge)**: All models vote on the drafts using a **strict 0-100 scoring system**.
+    *   Generic plans are penalized.
+    *   Technical depth is rewarded.
+3.  **Synthesis (Cross-Pollination)**: The Top 3 winners are merged into a single "Unified Blueprint".
+    *   The synthesizer explicitly combines the best ideas from different agents (e.g., "Use Gemini's database schema with Claude's API design").
+4.  **Boardroom Critique**: 
+    *   Agents act as "Senior Architects" to find fatal flaws in the Unified Blueprint.
+5.  **Final Polish**: The plan is rewritten to address all critiques, resulting in a **Master Plan**.
 
 ## 🛠 Setup
 
@@ -21,7 +22,7 @@ Ralph Brainstormer is a multi-agent planning engine that uses a "Debate & Consen
 - Access to AI CLIs:
   - **Claude**: `claude` (Claude Code)
   - **Gemini**: `gemini` (Gemini CLI)
-  - **Codex/GPT-4**: `openai` CLI (or simulated via Gemini)
+  - **Codex**: `codex` (via `npm install -g @shadow/codex` or similar) - **MUST be installed, simulation is disabled.**
 
 ### Installation
 1. Clone the repository:
@@ -29,7 +30,7 @@ Ralph Brainstormer is a multi-agent planning engine that uses a "Debate & Consen
    git clone https://github.com/alrightryanx/ralph-brainstormer.git
    cd ralph-brainstormer
    ```
-2. Install dependencies (if any):
+2. Install dependencies:
    ```bash
    pip install -r requirements.txt
    ```
